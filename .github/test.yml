@@ -1,0 +1,194 @@
+name: Release WRT.test
+run-name: Release - ${{ inputs.model }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        required: true
+        description: Device Model
+        type: choice
+        default: JDC_Athena_immwrt
+        options:
+          - JDC_Arthur_immwrt
+          - JDC_Athena_immwrt
+          - JDC_Arthur_libwrt
+          - JDC_Athena_libwrt
+          - jdcloud_ipq60xx_immwrt # zqinKing原版
+          - jdcloud_ipq60xx_libwrt # zqinKing原版
+          - x64_immwrt             # zqinKing原版
+      runs-on:
+        required: true
+        description: Runs on...
+        type: choice
+        default: ubuntu-22.04
+        options:
+          - ubuntu-20.04
+          - ubuntu-22.04
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+
+    steps:
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          remove-large-packages: "true"
+          remove-cached-tools: "true"
+          remove-swapfile: "true"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Check Disk Space
+        run: |
+          echo "===== 磁盘空间检查 ====="
+          df -h
+          FREE_SPACE=$(df -k --output=avail . | tail -n1)
+          MIN_SPACE=35000000  # 35GB
+          if [ $FREE_SPACE -lt $MIN_SPACE ]; then
+            echo "::error::磁盘空间不足! 可用: ${FREE_SPACE}KB, 需要: ${MIN_SPACE}KB"
+            exit 1
+          fi
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E apt -yqq install dos2unix
+          sudo -E apt -yqq install libfuse-dev
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+          sudo -E systemctl daemon-reload
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+          
+          # 创建内存文件系统
+          sudo mkdir /mnt/build
+          sudo mount -t tmpfs -o size=10G tmpfs /mnt/build
+          export ACTION_BUILD="/mnt/build"
+          echo "ACTION_BUILD=$ACTION_BUILD" >> $GITHUB_ENV
+          
+          # 创建必要的构建目录结构
+          mkdir -p /mnt/build/firmware
+
+      - name: Initialization Values
+        run: |
+          export BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")
+          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+          export BUILD_SRC=$(awk -F"=" '/REPO_URL/ {print $NF}' "./compilecfg/${{ inputs.model }}.ini")
+          echo "BUILD_SRC=$BUILD_SRC" >> $GITHUB_ENV
+          echo "BUILD_MODEL=${{ inputs.model }}" >> $GITHUB_ENV
+          
+          # 创建符号链接到内存文件系统
+          ln -s /mnt/build/firmware ./firmware
+
+      - name: Pre Clone
+        run: |
+          # 确保action_build目录为空或不存在
+          if [ -d "/mnt/build/action_build" ]; then
+            echo "清空现有的action_build目录..."
+            rm -rf /mnt/build/action_build/*
+          else
+            mkdir -p /mnt/build/action_build
+          fi
+          
+          # 确保配置文件存在
+          CONFIG_FILE="deconfig/${{ inputs.model }}.config"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::配置文件 $CONFIG_FILE 不存在!"
+            exit 1
+          fi
+          
+          # 复制配置文件
+          cp "$CONFIG_FILE" /mnt/build/action_build/.config
+          
+          # 运行预克隆脚本
+          ./pre_clone_action.sh ${{ inputs.model }}
+
+      - name: Cache Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./action_build/.ccache
+          key: ${{ inputs.runs-on }}-${{ env.BUILD_MODEL }}-${{ env.BUILD_DATE }}
+          restore-keys: |
+            ${{ inputs.runs-on }}-${{ env.BUILD_MODEL }}-
+
+      - name: Build Firmware
+        run: |
+          # 创建action_build符号链接（现在确保目录存在）
+          ln -s /mnt/build/action_build ./action_build
+          
+          # 构建固件
+          ./build.sh ${{ inputs.model }}
+          
+          # 清理编译目录
+          echo "===== 清理编译目录 ====="
+          rm -rf /mnt/build/action_build/build_dir/*
+          rm -rf /mnt/build/action_build/staging_dir/*
+          rm -rf /mnt/build/action_build/tmp/*
+
+      - name: Get Kernel Version
+        run: |
+          echo "KVER=$(find /mnt/build/action_build/dl -maxdepth 1 -name "linux-[4-6]\.*" | sort -r | head -n 1 | grep -oE "[4-6]\.[0-9]{1,3}\.[0-9]{1,3}")" >> $GITHUB_ENV
+
+      - name: Delete Old Cache
+        run: |
+          # 获取缓存列表并删除
+          gh cache list --key ${{ inputs.runs-on }}-${{ env.BUILD_MODEL }}- --json key --jq '.[] | .key' | while read -r key; do
+            gh cache delete "$key" --confirm
+          done
+          
+          # 输出缓存状态
+          echo "========cache status========"
+          echo "ccache: $(du -sh /mnt/build/action_build/.ccache | cut -f 1)"
+
+      - name: Machine Information
+        run: |
+          echo "=============================================="
+          lscpu | grep -E "name|Core|Thread"
+          echo "=============================================="
+          df -h
+          echo "=============================================="
+          echo "内存文件系统使用情况:"
+          du -sh /mnt/build/*
+
+      - name: Package OpenWrt Firmware
+        if: ${{ inputs.model == 'n1_immwrt' }}
+        uses: unifreq/openwrt_packit@master
+        env:
+          OPENWRT_ARMVIRT: firmware/*.tar.gz
+          PACKAGE_SOC: s905d
+          KERNEL_VERSION_NAME: 6.6.y
+          WHOAMI: Mary
+
+      - name: Prepare Release Body
+        run: |
+          echo "云编译发布" > release_body.txt
+          echo "源码：${{ env.BUILD_SRC }}" >> release_body.txt
+          echo "Kernel: ${{ env.KVER }}" >> release_body.txt
+          echo "亚瑟禁用USB.Docker.Coremark/雅典娜禁用Docker.Coremark" >> release_body.txt
+          echo "Lucky手动替换/patches下同名文件" >> release_body.txt
+          echo "ipq60xx和x64暂与zqinking相同未作改变" >> release_body.txt
+          echo "WIFI密码: 12345678" >> release_body.txt
+          echo "LAN地址: 192.168.111.1" >> release_body.txt
+          echo "插件：" >> release_body.txt
+          echo "$(grep -oP "luci-app(-[a-zA-Z0-9]{1,}){1,}" ./firmware/*.manifest | awk -F":" '{print $NF}')"  >> release_body.txt
+
+      - name: Release Firmware
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.BUILD_DATE }}_${{ inputs.model }}
+          files: ${{ inputs.model == 'n1_immwrt' && env.PACKAGED_OUTPUTPATH || './firmware' }}/*.*
+          body_path: ./release_body.txt
